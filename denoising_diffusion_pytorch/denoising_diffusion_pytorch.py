@@ -370,6 +370,100 @@ class SuperMidBlock(Module):
         x = self.resnet_block2(x, time_emb)
         return x
 
+class UpBlock(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        full_attn,
+        attn_heads,
+        attn_dim_head,
+        kernel_size,
+        padding,
+        flash_attn,
+        time_dim,
+        dropout,
+        is_last
+    ):
+        FullAttention = partial(Attention, flash = flash_attn)
+        resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
+        attn_klass = FullAttention if full_attn else LinearAttention
+
+        super().__init__()
+
+        self.resnet_block1 = resnet_block(dim_out + dim_in, dim_out)
+        self.resnet_block2 = resnet_block(dim_out + dim_in, dim_out)
+        self.attn = attn_klass(dim_out, dim_head = attn_dim_head, heads = attn_heads)
+        self.upsample = Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, kernel_size, padding=padding)
+
+    def forward(self, x, time_emb, h):
+        x = torch.cat((x, h.pop()), dim=1)
+        x = self.resnet_block1(x, time_emb)
+
+        x = torch.cat((x, h.pop()), dim=1)
+        x = self.resnet_block2(x, time_emb)
+        x = self.attn(x) + x
+
+        x = self.upsample(x)
+        return x
+
+class SuperUpBlock(Module):
+    def __init__(
+        self,
+        in_out,
+        full_attn,
+        attn_heads,
+        attn_dim_head,
+        kernel_size,
+        padding,
+        flash_attn,
+        time_dim,
+        dropout
+    ):
+        super().__init__()
+        self.ups = ModuleList([])
+        num_resolutions = len(in_out)
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
+            is_last = ind == (num_resolutions - 1)
+            self.ups.append(
+                UpBlock(dim_in, dim_out, layer_full_attn, layer_attn_heads, layer_attn_dim_head,
+                        kernel_size, padding, flash_attn, time_dim, dropout, is_last))
+
+    def forward(self, x, time_emb, h):
+        for up_block in self.ups:
+            x = up_block(x, time_emb, h)
+        return x
+
+class TimeEmbed(Module):
+    def __init__(
+        self,
+        dim,
+        time_dim,
+        learned_sinusoidal_cond=False,
+        random_fourier_features=False,
+        learned_sinusoidal_dim=16,
+        sinusoidal_pos_emb_theta=10000
+    ):
+        super().__init__()
+        random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+
+        if random_or_learned_sinusoidal_cond:
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim, theta=sinusoidal_pos_emb_theta)
+            fourier_dim = dim
+
+        self.mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+    def forward(self, t):
+        return self.mlp(t)
+
 #endregion
 
 # model
@@ -427,6 +521,8 @@ class Unet(Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
+        self.new_time = TimeEmbed(dim, time_dim, learned_sinusoidal_cond, random_fourier_features,
+                                  learned_sinusoidal_dim, sinusoidal_pos_emb_theta)
 
         # attention
 
@@ -442,33 +538,21 @@ class Unet(Module):
 
         # prepare blocks
 
-        FullAttention = partial(Attention, flash = flash_attn)
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
         # layers
 
-        self.ups = ModuleList([])
         self.num_resolutions = len(in_out)
 
         self.super_down_block = SuperDownBlock(
             in_out, full_attn, attn_heads, attn_dim_head, kernel_size=3, padding=1, flash_attn=flash_attn,
             time_dim=time_dim, dropout=dropout)
 
-        self.super_mid_block = SuperMidBlock(mid_dim=dims[-1],
-            attn_heads = attn_heads[-1], attn_dim_head = attn_dim_head[-1],
-            time_dim = time_dim, dropout = dropout, flash_attn = flash_attn)
+        self.super_mid_block = SuperMidBlock(dim=dims[-1], attn_heads=attn_heads[-1], attn_dim_head=attn_dim_head[-1],
+            time_dim=time_dim, dropout=dropout, flash_attn=flash_attn)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
-            is_last = ind == (len(in_out) - 1)
-
-            attn_klass = FullAttention if layer_full_attn else LinearAttention
-
-            self.ups.append(ModuleList([
-                resnet_block(dim_out + dim_in, dim_out),
-                resnet_block(dim_out + dim_in, dim_out),
-                attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
-            ]))
+        self.super_up_block = SuperUpBlock(in_out, full_attn, attn_heads, attn_dim_head, kernel_size=3, padding=1, flash_attn=flash_attn,
+            time_dim=time_dim, dropout=dropout)
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
@@ -490,21 +574,14 @@ class Unet(Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        t = self.time_mlp(time)
+        # t = self.time_mlp(time)
+        t = self.new_time(time)
 
         x, h = self.super_down_block(x, t)
 
         x = self.super_mid_block(x, t)
 
-        for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim = 1)
-            x = block1(x, t)
-
-            x = torch.cat((x, h.pop()), dim = 1)
-            x = block2(x, t)
-            x = attn(x) + x
-
-            x = upsample(x)
+        x = self.super_up_block(x, t, h)
 
         x = torch.cat((x, r), dim = 1)
 
