@@ -32,11 +32,13 @@ from denoising_diffusion_pytorch.attend import Attend
 
 from denoising_diffusion_pytorch.version import __version__
 
-# constants
+#region constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
-# helpers functions
+#endregion
+
+#region helper functions
 
 def exists(x):
     return x is not None
@@ -78,7 +80,9 @@ def convert_image_to_fn(img_type, image):
         return image.convert(img_type)
     return image
 
-# normalization functions
+#endregion
+
+#region normalization functions
 
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
@@ -86,7 +90,9 @@ def normalize_to_neg_one_to_one(img):
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
-# small helper modules
+#endregion
+
+#region small helper modules
 
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
@@ -109,7 +115,9 @@ class RMSNorm(Module):
     def forward(self, x):
         return F.normalize(x, dim = 1) * self.g * self.scale
 
-# sinusoidal positional embeds
+#endregion
+
+#region sinusoidal positional embeds
 
 class SinusoidalPosEmb(Module):
     def __init__(self, dim, theta = 10000):
@@ -143,7 +151,9 @@ class RandomOrLearnedSinusoidalPosEmb(Module):
         fouriered = torch.cat((x, fouriered), dim = -1)
         return fouriered
 
-# building block modules
+#endregion
+
+#region building block modules
 
 class ConvBlock(Module):
     def __init__(self, dim, dim_out, dropout = 0.):
@@ -295,7 +305,7 @@ class DownBlock(Module):
         self.resnet_block1 = resnet_block(dim_in, dim_in)
         self.resnet_block2 = resnet_block(dim_in, dim_in)
         self.attn = attn_klass(dim_in, dim_head = attn_dim_head, heads = attn_heads)
-        self.downsample = Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, kernel_size, padding)
+        self.downsample = Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, kernel_size, padding=padding)
 
     def forward(self, x, time_emb):
         h = []
@@ -306,7 +316,6 @@ class DownBlock(Module):
         h.append(x)
         x = self.downsample(x)
         return x, h
-
 
 class SuperDownBlock(Module):
     def __init__(
@@ -336,6 +345,32 @@ class SuperDownBlock(Module):
             x, h_block = down_block(x, time_emb)
             h.extend(h_block)
         return x, h
+
+class SuperMidBlock(Module):
+    def __init__(
+        self,
+        dim,
+        attn_heads,
+        attn_dim_head,
+        time_dim,
+        dropout,
+        flash_attn
+    ):
+        super().__init__()
+        FullAttention = partial(Attention, flash = flash_attn)
+        resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
+
+        self.resnet_block1 = resnet_block(dim, dim)
+        self.attn = FullAttention(dim, heads = attn_heads, dim_head = attn_dim_head)
+        self.resnet_block2 = resnet_block(dim, dim)
+
+    def forward(self, x, time_emb):
+        x = self.resnet_block1(x, time_emb)
+        x = self.attn(x) + x
+        x = self.resnet_block2(x, time_emb)
+        return x
+
+#endregion
 
 # model
 
@@ -419,10 +454,9 @@ class Unet(Module):
             in_out, full_attn, attn_heads, attn_dim_head, kernel_size=3, padding=1, flash_attn=flash_attn,
             time_dim=time_dim, dropout=dropout)
 
-        mid_dim = dims[-1]
-        self.mid_block1 = resnet_block(mid_dim, mid_dim)
-        self.mid_attn = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
-        self.mid_block2 = resnet_block(mid_dim, mid_dim)
+        self.super_mid_block = SuperMidBlock(mid_dim=dims[-1],
+            attn_heads = attn_heads[-1], attn_dim_head = attn_dim_head[-1],
+            time_dim = time_dim, dropout = dropout, flash_attn = flash_attn)
 
         for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
             is_last = ind == (len(in_out) - 1)
@@ -460,9 +494,7 @@ class Unet(Module):
 
         x, h = self.super_down_block(x, t)
 
-        x = self.mid_block1(x, t)
-        x = self.mid_attn(x) + x
-        x = self.mid_block2(x, t)
+        x = self.super_mid_block(x, t)
 
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim = 1)
@@ -479,7 +511,7 @@ class Unet(Module):
         x = self.final_res_block(x, t)
         return self.final_conv(x)
 
-# gaussian diffusion trainer class
+#region gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
@@ -886,6 +918,8 @@ class GaussianDiffusion(Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
+
+#endregion
 
 # dataset classes
 
