@@ -508,20 +508,7 @@ class Unet(Module):
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
-        if self.random_or_learned_sinusoidal_cond:
-            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
-            fourier_dim = learned_sinusoidal_dim + 1
-        else:
-            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
-            fourier_dim = dim
-
-        self.time_mlp = nn.Sequential(
-            sinu_pos_emb,
-            nn.Linear(fourier_dim, time_dim),
-            nn.GELU(),
-            nn.Linear(time_dim, time_dim)
-        )
-        self.new_time = TimeEmbed(dim, time_dim, learned_sinusoidal_cond, random_fourier_features,
+        self.time_mlp = TimeEmbed(dim, time_dim, learned_sinusoidal_cond, random_fourier_features,
                                   learned_sinusoidal_dim, sinusoidal_pos_emb_theta)
 
         # attention
@@ -574,8 +561,7 @@ class Unet(Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        # t = self.time_mlp(time)
-        t = self.new_time(time)
+        t = self.time_mlp(time)
 
         x, h = self.super_down_block(x, t)
 
