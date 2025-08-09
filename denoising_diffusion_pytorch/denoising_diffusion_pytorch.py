@@ -145,7 +145,7 @@ class RandomOrLearnedSinusoidalPosEmb(Module):
 
 # building block modules
 
-class Block(Module):
+class ConvBlock(Module):
     def __init__(self, dim, dim_out, dropout = 0.):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
@@ -172,8 +172,8 @@ class ResnetBlock(Module):
             nn.Linear(time_emb_dim, dim_out * 2)
         ) if exists(time_emb_dim) else None
 
-        self.block1 = Block(dim, dim_out, dropout = dropout)
-        self.block2 = Block(dim_out, dim_out)
+        self.block1 = ConvBlock(dim, dim_out, dropout = dropout)
+        self.block2 = ConvBlock(dim_out, dim_out)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None):
@@ -271,6 +271,72 @@ class Attention(Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
+class DownBlock(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        full_attn,
+        attn_heads,
+        attn_dim_head,
+        kernel_size,
+        padding,
+        flash_attn,
+        time_dim,
+        dropout,
+        is_last
+    ):
+        FullAttention = partial(Attention, flash=flash_attn)
+        resnet_block = partial(ResnetBlock, time_emb_dim=time_dim, dropout=dropout)
+        attn_klass = FullAttention if full_attn else LinearAttention
+
+        super().__init__()
+
+        self.resnet_block1 = resnet_block(dim_in, dim_in)
+        self.resnet_block2 = resnet_block(dim_in, dim_in)
+        self.attn = attn_klass(dim_in, dim_head = attn_dim_head, heads = attn_heads)
+        self.downsample = Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, kernel_size, padding)
+
+    def forward(self, x, time_emb):
+        h = []
+        x = self.resnet_block1(x, time_emb)
+        h.append(x)
+        x = self.resnet_block2(x, time_emb)
+        x = self.attn(x) + x
+        h.append(x)
+        x = self.downsample(x)
+        return x, h
+
+
+class SuperDownBlock(Module):
+    def __init__(
+        self,
+        in_out,
+        full_attn,
+        attn_heads,
+        attn_dim_head,
+        kernel_size,
+        padding,
+        flash_attn,
+        time_dim,
+        dropout
+    ):
+        super().__init__()
+        self.downs = ModuleList([])
+        num_resolutions = len(in_out)
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
+            is_last = ind >= (num_resolutions - 1)
+            self.downs.append(
+                DownBlock(dim_in, dim_out, layer_full_attn, layer_attn_heads, layer_attn_dim_head,
+                          kernel_size, padding, flash_attn, time_dim, dropout, is_last))
+
+    def forward(self, x, time_emb):
+        h = []
+        for down_block in self.downs:
+            x, h_block = down_block(x, time_emb)
+            h.extend(h_block)
+        return x, h
+
 # model
 
 class Unet(Module):
@@ -348,19 +414,11 @@ class Unet(Module):
 
         self.downs = ModuleList([])
         self.ups = ModuleList([])
-        num_resolutions = len(in_out)
+        self.num_resolutions = len(in_out)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
-            is_last = ind >= (num_resolutions - 1)
-
-            attn_klass = FullAttention if layer_full_attn else LinearAttention
-
-            self.downs.append(ModuleList([
-                resnet_block(dim_in, dim_in),
-                resnet_block(dim_in, dim_in),
-                attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
-            ]))
+        self.super_down_block = SuperDownBlock(
+            in_out, full_attn, attn_heads, attn_dim_head, kernel_size=3, padding=1, flash_attn=flash_attn,
+            time_dim=time_dim, dropout=dropout)
 
         mid_dim = dims[-1]
         self.mid_block1 = resnet_block(mid_dim, mid_dim)
@@ -387,7 +445,7 @@ class Unet(Module):
 
     @property
     def downsample_factor(self):
-        return 2 ** (len(self.downs) - 1)
+        return 2 ** (self.num_resolutions - 1)
 
     def forward(self, x, time, x_self_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
@@ -401,17 +459,7 @@ class Unet(Module):
 
         t = self.time_mlp(time)
 
-        h = []
-
-        for block1, block2, attn, downsample in self.downs:
-            x = block1(x, t)
-            h.append(x)
-
-            x = block2(x, t)
-            x = attn(x) + x
-            h.append(x)
-
-            x = downsample(x)
+        x, h = self.super_down_block(x, t)
 
         x = self.mid_block1(x, t)
         x = self.mid_attn(x) + x
