@@ -464,6 +464,17 @@ class TimeEmbed(Module):
     def forward(self, t):
         return self.mlp(t)
 
+class FinalBlock(Module):
+    def __init__(self, init_dim, out_dim, time_dim, dropout):
+        resnet_block = partial(ResnetBlock, time_emb_dim=time_dim, dropout=dropout)
+        super().__init__()
+        self.resnet_block = resnet_block(init_dim * 2, init_dim)
+        self.conv = nn.Conv2d(init_dim, out_dim, 1)
+
+    def forward(self, x, time_emb):
+        x = self.resnet_block(x, time_emb)
+        return self.conv(x)
+
 #endregion
 
 # model
@@ -523,12 +534,6 @@ class Unet(Module):
 
         assert len(full_attn) == len(dim_mults)
 
-        # prepare blocks
-
-        resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
-
-        # layers
-
         self.num_resolutions = len(in_out)
 
         self.super_down_block = SuperDownBlock(
@@ -544,8 +549,7 @@ class Unet(Module):
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = resnet_block(init_dim * 2, init_dim)
-        self.final_conv = nn.Conv2d(init_dim, self.out_dim, 1)
+        self.final_block = FinalBlock(init_dim, self.out_dim, time_dim, dropout)
 
     @property
     def downsample_factor(self):
@@ -571,8 +575,9 @@ class Unet(Module):
 
         x = torch.cat((x, r), dim = 1)
 
-        x = self.final_res_block(x, t)
-        return self.final_conv(x)
+        x = self.final_block(x,t)
+
+        return x
 
 #region gaussian diffusion trainer class
 
