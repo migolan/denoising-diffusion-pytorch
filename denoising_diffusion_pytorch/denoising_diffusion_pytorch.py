@@ -412,7 +412,6 @@ class Unet(Module):
 
         # layers
 
-        self.downs = ModuleList([])
         self.ups = ModuleList([])
         self.num_resolutions = len(in_out)
 
